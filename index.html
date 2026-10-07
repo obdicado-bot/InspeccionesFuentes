@@ -189,7 +189,7 @@ textarea.in{min-height:70px;resize:vertical}
     </div>
   </header>
   <main>
-    <div id="startView" hidden><div class="card start-card"><h3>Inspección de fuentes de agua</h3><p>Inicia una auditoría y registra dentro de ella todas las fuentes que correspondan. Puedes finalizar aunque queden fuentes pendientes.</p><button class="btn" id="startNew" type="button">Iniciar nueva inspección</button><p id="startSaved" style="margin-top:18px;font-size:.88rem" hidden>Hay una inspección activa guardada. Puedes continuarla desde el menú ☰.</p></div></div>
+    <div id="startView" hidden><div class="card start-card"><h3>Inspección de fuentes de agua</h3><p>Inicia una auditoría nueva y registra las fuentes que correspondan. Puedes finalizar aunque queden fuentes pendientes.</p><button class="btn" id="startNew" type="button">Iniciar nuevas inspecciones</button><p id="startSaved" style="margin-top:18px;font-size:.88rem" hidden>Hay una inspección anterior guardada. Puedes verla en el menú ☰.</p></div></div>
     <div id="queueBanner" class="queue" hidden>
       <div class="row"><strong>Envío pendiente</strong></div>
       <p style="margin:6px 0 10px" id="queueTxt"></p>
@@ -262,6 +262,7 @@ const ITEMS = [
   {k:"plagas",     n:"Plagas",       t:"Plagas",             q:"¿La fuente está libre de plagas o evidencia de ellas?"}
 ];
 const MAX_FOTOS = 2;
+const HOUR = 60*60*1000, EXP_MS = 48*HOUR;
 const ALL_FUENTES = Object.entries(TIPOS).flatMap(([t,v])=>v.fuentes.map(f=>({tipo:t,fuente:f,key:`${t}|${f}`})));
 const TOTAL_FUENTES = ALL_FUENTES.length;
 
@@ -271,62 +272,37 @@ const store = {
   get(k,d){try{const v=localStorage.getItem(k);return v?JSON.parse(v):d}catch(e){return d}},
   set(k,v){try{localStorage.setItem(k,JSON.stringify(v));return true}catch(e){return false}}
 };
-const DB_NAME="InspeccionFuentesDB", DB_STORE="estado";
-let persistQueue=Promise.resolve();
-function openDb(){return new Promise((resolve,reject)=>{
-  if(!window.indexedDB) return reject(new Error("IndexedDB no disponible"));
-  const req=indexedDB.open(DB_NAME,1);
-  req.onupgradeneeded=()=>{if(!req.result.objectStoreNames.contains(DB_STORE))req.result.createObjectStore(DB_STORE)};
-  req.onsuccess=()=>resolve(req.result);req.onerror=()=>reject(req.error);
-})}
-async function dbGet(key,def){
-  const db=await openDb();
-  return new Promise((resolve,reject)=>{const tx=db.transaction(DB_STORE,"readonly"),req=tx.objectStore(DB_STORE).get(key);req.onsuccess=()=>resolve(req.result??def);req.onerror=()=>reject(req.error);tx.oncomplete=()=>db.close()});
-}
-async function dbSet(key,value){
-  const db=await openDb();
-  return new Promise((resolve,reject)=>{const tx=db.transaction(DB_STORE,"readwrite");tx.objectStore(DB_STORE).put(value,key);tx.oncomplete=()=>{db.close();resolve(true)};tx.onerror=()=>{db.close();reject(tx.error)}});
-}
 const hoy = () => new Date().toLocaleDateString("en-CA");
 const horaAhora = () => new Date().toTimeString().slice(0,5);
 const fmt = ts => new Date(ts).toLocaleString("es-EC",{day:"numeric",month:"short",year:"numeric",hour:"numeric",minute:"2-digit"});
 
-/* Solo existe una inspección activa y un único PDF completo asociado a ella. */
+/* records: persisten 48h en este navegador. informes: PDFs generados al finalizar. */
 let records = {};
+let previousRecords = {};
+let informes = {};
 let draft = null;
 let pendingSend = null;
-let lastPdf = null;
 let warnedQuota = false;
 
 function toast(msg){const t=$("toast");t.textContent=msg;t.hidden=false;clearTimeout(toast.h);toast.h=setTimeout(()=>t.hidden=true,3600)}
 
 /* ========= PERSISTENCIA ========= */
-async function loadPersisted(){
-  const oldRecords=store.get("records",{});
-  try{
-    const saved=await dbGet("records",null);
-    records=saved===null?oldRecords:saved;
-    if(saved===null&&Object.keys(oldRecords).length) await dbSet("records",oldRecords);
-    lastPdf=await dbGet("pdfCompleto",null);
-    localStorage.removeItem("records");
-  }catch(e){ records=oldRecords; }
-  /* Limpia datos creados por versiones anteriores, que duplicaban fotos y PDF. */
-  try{ localStorage.removeItem("previousRecords"); localStorage.removeItem("informes"); }catch(e){}
+function loadPersisted(){
+  records = store.get("records",{});
+  previousRecords = store.get("previousRecords",{});
+  informes = store.get("informes",{});
+  cleanupExpired();
+}
+function cleanupExpired(){
+  const now=Date.now(); let changed=false;
+  Object.keys(records).forEach(k=>{ if(!records[k].expiresAt||records[k].expiresAt<now){ delete records[k]; changed=true; } });
+  Object.keys(previousRecords).forEach(k=>{ if(!previousRecords[k].expiresAt||previousRecords[k].expiresAt<now){ delete previousRecords[k]; changed=true; } });
+  Object.keys(informes).forEach(k=>{ if(!informes[k].expiresAt||informes[k].expiresAt<now){ delete informes[k]; changed=true; } });
+  if(changed) persist();
 }
 function persist(){
-  const snapshot=typeof structuredClone==="function"?structuredClone(records):JSON.parse(JSON.stringify(records));
-  persistQueue=persistQueue.then(()=>dbSet("records",snapshot)).catch(()=>{
-    const okR=store.set("records",snapshot);
-    if(!okR&&!warnedQuota){warnedQuota=true;toast("No se pudo guardar: finaliza o elimina algunas fotos antes de cerrar.")}
-  });
-  return persistQueue;
-}
-function persistPdf(){
-  const snapshot=lastPdf;
-  persistQueue=persistQueue.then(()=>dbSet("pdfCompleto",snapshot)).catch(()=>{
-    if(!warnedQuota){warnedQuota=true;toast("No se pudo conservar el PDF en este dispositivo; descárgalo antes de cerrar.")}
-  });
-  return persistQueue;
+  const okR=store.set("records",records), okP=store.set("previousRecords",previousRecords), okI=store.set("informes",informes);
+  if((!okR||!okP||!okI)&&!warnedQuota){ warnedQuota=true; toast("Memoria local llena: esto seguirá disponible mientras no cierres la página, pero podría no guardarse para después."); }
 }
 function downloadPdf(base64,filename){
   const a=document.createElement("a");
@@ -363,19 +339,19 @@ function closeModal(){$("modalRoot").hidden=true;$("modalRoot").innerHTML=""}
 })();
 
 /* ========= LOGIN ========= */
-async function showApp(){
+function showApp(){
   $("login").hidden=true; $("app").hidden=false;
   $("hLogo").src=$("lLogo").src;
   $("insp").value="";
-  await loadPersisted(); renderList(); showStart();
+  loadPersisted(); renderList(); showStart();
 }
 function showStart(){
   $("startView").hidden=false;$("listView").hidden=true;$("checkView").hidden=true;$("doneView").hidden=true;$("finalBar").hidden=true;
-  $("startSaved").hidden=!Object.keys(records).length;
+  $("startSaved").hidden=!Object.keys(records).length&&!Object.keys(previousRecords).length;
 }
 $("startNew").addEventListener("click",()=>{
-  records={};draft=null;pendingSend=null;lastPdf=null;
-  $("insp").value="";store.set("insp","");persist();persistPdf();renderList();renderQueue();
+  Object.assign(previousRecords,records);records={};draft=null;pendingSend=null;lastPdf=null;
+  $("insp").value="";store.set("insp","");persist();renderList();renderQueue();
   $("startView").hidden=true;$("listView").hidden=false;$("finalBar").hidden=false;window.scrollTo({top:0});
 });
 $("loginForm").addEventListener("submit",e=>{
@@ -445,14 +421,12 @@ function loadImg(file){return new Promise((res,rej)=>{
   i.src=u;
 })}
 async function compress(file){
-  const img=await loadImg(file), M=720;
+  const img=await loadImg(file), M=1000;
   const s=Math.min(1,M/Math.max(img.naturalWidth,img.naturalHeight));
   const w=Math.round(img.naturalWidth*s), h=Math.round(img.naturalHeight*s);
   const c=document.createElement("canvas"); c.width=w; c.height=h;
   const x=c.getContext("2d"); x.fillStyle="#fff"; x.fillRect(0,0,w,h); x.drawImage(img,0,0,w,h);
-  const result=c.toDataURL("image/jpeg",0.45);
-  c.width=1;c.height=1;
-  return result;
+  return c.toDataURL("image/jpeg",0.6);
 }
 function nFotos(k){ return (draft.fotos[k]||[]).length }
 async function addFiles(it,files,box){
@@ -464,11 +438,11 @@ async function addFiles(it,files,box){
 }
 function renderPhotos(it,box){
   const list=draft.fotos[it.k]||[], full=list.length>=MAX_FOTOS;
-  const reqd = draft.resp[it.k]==="No cumple";
+  const reqd = draft.resp[it.k]!=="N/A";
   box.innerHTML="";
   const p=document.createElement("p");
   p.className="pcount"+(reqd&&!list.length?" need":"");
-  p.textContent=`Fotos: ${list.length} de ${MAX_FOTOS} (${reqd?"mínimo 1 obligatorio":"opcional"})`;
+  p.textContent=`Fotos: ${list.length} de ${MAX_FOTOS} (${reqd?"mínimo 1":"opcional"})`;
   box.appendChild(p);
   if(list.length){
     const th=document.createElement("div"); th.className="thumbs";
@@ -546,7 +520,7 @@ function updateValidation(){
   const c=calcEntry();
   const allAnswered=c.answered===ITEMS.length;
   const commentOk=ITEMS.every(i=>draft.resp[i.k]!=="No cumple"||(draft.obs[i.k]||"").trim());
-  const photoOk=ITEMS.every(i=>draft.resp[i.k]!=="No cumple"||nFotos(i.k)>=1);
+  const photoOk=ITEMS.every(i=>draft.resp[i.k]==="N/A"||nFotos(i.k)>=1);
   $("resultBox").hidden=!allAnswered;
   if(allAnswered){
     const label = c.aplic===0 ? "No aplica" : (c.bad?"No conforme":"Conforme");
@@ -555,7 +529,7 @@ function updateValidation(){
   }
   $("saveEntry").disabled=!(allAnswered&&commentOk&&photoOk);
   $("saveErr").textContent = !allAnswered?"" : !commentOk ? "Describe la observación de cada punto marcado como No cumple."
-    : !photoOk ? "Agrega al menos una foto en cada punto marcado como No cumple." : "";
+    : !photoOk ? "Agrega al menos una foto en cada punto marcado como Cumple o No cumple." : "";
 }
 function isDirty(){
   const ex=entryOf(draft.tipo,draft.fuente);
@@ -580,6 +554,7 @@ $("saveEntry").addEventListener("click",()=>{
   draft.inspector=$("insp").value.trim();
   if(!draft.createdAt) draft.createdAt=now;
   draft.updatedAt=now;
+  if(!draft.expiresAt) draft.expiresAt=draft.createdAt+EXP_MS;
   draft.estado="borrador";              // guardar (o corregir) siempre deja la fuente pendiente de enviar
   draft.savedAt=now;
   records[draft.key]=draft;
@@ -850,21 +825,11 @@ function renderQueue(){
 }
 function markSent(packet,batchId){
   const rec=records[packet.key];
-  if(rec){
-    rec.estado="enviada"; rec.sentAt=Date.now(); rec.sentBatchId=batchId;
-    /* Las fotos ya están en Power Automate y en el PDF: se liberan del teléfono. */
-    rec.fotos={};
-    records[packet.key]=rec; persist();
-  }
+  if(rec){ rec.estado="enviada"; rec.sentAt=Date.now(); rec.sentBatchId=batchId; records[packet.key]=rec; persist(); }
 }
 async function sendPackets(packets,batchId){
   for(let i=0;i<packets.length;i++){
-    try{
-      const p=packets[i];
-      const body=p.body||buildPayload(p.entry,p.meta,p.pdfB64||"",batchId,!!p.incluirInforme);
-      await post(body); markSent(p,batchId);
-      p.body=null;p.entry=null;p.pdfB64="";
-    }
+    try{ await post(packets[i].body); markSent(packets[i],batchId); }
     catch(error){ error.unsent=packets.slice(i); throw error; }
   }
 }
@@ -880,6 +845,7 @@ $("retry").addEventListener("click",async()=>{
   $("retry").disabled=false; $("retry").textContent="Reintentar envío";
 });
 
+let lastPdf=null;
 function showDone(allEntries,sentCount){
   const conf=allEntries.filter(e=>e.resultado==="Conforme").length;
   const noConf=allEntries.filter(e=>e.resultado==="No conforme").length;
@@ -891,8 +857,8 @@ function showDone(allEntries,sentCount){
   window.scrollTo({top:0});
 }
 $("doneNew").addEventListener("click",()=>{
-  records={};draft=null;pendingSend=null;lastPdf=null;
-  $("insp").value="";store.set("insp","");persist();persistPdf();renderQueue();renderList();
+  Object.assign(previousRecords,records);records={};draft=null;pendingSend=null;lastPdf=null;
+  $("insp").value="";store.set("insp","");persist();renderQueue();renderList();
   $("finalBar").style.display="";showStart();window.scrollTo({top:0});
 });
 $("doneDownload").addEventListener("click",()=>{
@@ -913,11 +879,11 @@ async function doFinalize(){
   const nombre=`Inspeccion_fuentes_agua_${meta.fecha}.pdf`;
   if(pdfB64){
     lastPdf={base64:pdfB64,nombre};
-    persistPdf();
+    informes[batchId]={base64:pdfB64,nombre,createdAt:Date.now(),expiresAt:Date.now()+EXP_MS,count:allEntries.length};
   }
   const packets=newEntries.map((entry,index)=>({
     key:entry.key,
-    entry,meta,pdfB64:index===0?pdfB64:"",incluirInforme:index===0
+    body:buildPayload(entry,meta,pdfB64,batchId,index===0)
   }));
   btn.textContent="Enviando…";
   try{
@@ -952,44 +918,59 @@ $("finalBtn").addEventListener("click",()=>{
 /* ========= PANEL "INSPECCIONES GUARDADAS" ========= */
 function closePanel(){ $("panelRoot").hidden=true; $("panelRoot").innerHTML=""; $("openPanel").setAttribute("aria-expanded","false"); }
 function openPanel(){
+  cleanupExpired();
   const root=$("panelRoot");
-  const list=Object.values(records);
-  const completed=list.length;
-  const sent=list.filter(r=>r.estado==="enviada").length;
-  const drafts=completed-sent;
-  const latest=list.reduce((max,r)=>Math.max(max,r.updatedAt||0),0);
-  const inspector=list.find(r=>r.inspector)?.inspector||$("insp").value||"Sin inspector";
+  const list=Object.values(records).sort((a,b)=>(b.updatedAt||0)-(a.updatedAt||0));
   root.innerHTML=`<div class="panelOverlay"></div><div class="panel">
-    <div class="phead"><h3>Inspección guardada</h3><button type="button" id="closePanel" aria-label="Cerrar">×</button></div>
-    <p class="pnote">Todas las fuentes pertenecen a una sola inspección. Desde aquí puedes reanudarla completa o descargar su único informe PDF.</p>
+    <div class="phead"><h3>Inspecciones guardadas</h3><button type="button" id="closePanel" aria-label="Cerrar">×</button></div>
+    <p class="pnote">En este navegador durante 48 horas desde su creación. Los borradores permiten continuar o corregir; los registros enviados permiten descargar el PDF.</p>
     <div class="plist" id="plist"></div>
-    <div class="pfoot"><button class="btn ghost" id="clearLocal" type="button">Borrar inspección del dispositivo</button><small>No elimina los datos que ya fueron enviados a Power Automate.</small></div>
+    <div class="pfoot"><button class="btn ghost" id="clearLocal" type="button">Borrar datos locales</button><small>No elimina los registros ya enviados al servidor.</small></div>
   </div>`;
   const plist=$("plist");
-  if(!completed){
-    plist.innerHTML='<p class="pempty">Todavía no hay una inspección guardada.</p>';
-  }else{
+  if(!list.length) plist.innerHTML='<p class="pempty">Todavía no has guardado ninguna fuente en la nueva inspección.</p>';
+  list.forEach(r=>{
     const card=document.createElement("div"); card.className="pcard";
-    card.innerHTML=`<h4>Inspección completa de fuentes</h4>
-      <p class="psub">Inspector: ${inspector}<br>${completed} de ${TOTAL_FUENTES} fuentes llenadas</p>
-      <p class="pstatus ${drafts?"draft":"sent"}">${drafts?`${drafts} fuente(s) pendientes de enviar`:`${sent} fuente(s) enviadas`}${latest?` · ${fmt(latest)}`:""}</p>
+    const sub = r.estado==="enviada" ? shortObs(r) : (r.inspector||"Sin inspector");
+    card.innerHTML=`<h4>${r.tipo} · Fuente ${r.fuente}</h4><p class="psub">${sub}</p>
+      <p class="pstatus ${r.estado==="enviada"?"sent":"draft"}">${r.estado==="enviada"?"Enviada":"Borrador"} · ${fmt(r.updatedAt)}</p>
+      <p class="pexp">Se elimina: ${fmt(r.expiresAt)}</p>
       <div class="pbtns"></div>`;
     const btns=card.querySelector(".pbtns");
-    const resume=document.createElement("button");resume.className="btn";resume.type="button";resume.textContent="Reanudar inspección";resume.style.width="auto";
-    resume.onclick=()=>{closePanel();$("startView").hidden=true;$("doneView").hidden=true;$("listView").hidden=false;$("finalBar").style.display="";$("finalBar").hidden=false;$("insp").value=inspector==="Sin inspector"?"":inspector;renderList();window.scrollTo({top:0})};
-    btns.appendChild(resume);
-    if(lastPdf){
-      const pdf=document.createElement("button");pdf.className="btn ghost";pdf.type="button";pdf.textContent="Descargar PDF completo";
-      pdf.onclick=()=>downloadPdf(lastPdf.base64,lastPdf.nombre);
-      btns.appendChild(pdf);
+    if(r.estado==="enviada"){
+      const bd=document.createElement("button"); bd.className="btn ghost"; bd.type="button"; bd.textContent="Descargar PDF";
+      bd.onclick=()=>{ const inf=informes[r.sentBatchId]; if(inf) downloadPdf(inf.base64,inf.nombre); else toast("El PDF de ese envío ya no está disponible en este navegador."); };
+      const bc=document.createElement("button"); bc.className="btn ghost"; bc.type="button"; bc.textContent="Corregir";
+      bc.onclick=()=>{ closePanel();$("startView").hidden=true;$("finalBar").hidden=false;$("insp").value=r.inspector||"";openCheck(r.tipo,r.fuente); };
+      btns.append(bd,bc);
+    }else{
+      const bc=document.createElement("button"); bc.className="btn"; bc.type="button"; bc.textContent="Continuar"; bc.style.width="auto";
+      bc.onclick=()=>{ closePanel();$("startView").hidden=true;$("finalBar").hidden=false;$("insp").value=r.inspector||"";openCheck(r.tipo,r.fuente); };
+      btns.append(bc);
     }
+    const del=document.createElement("button"); del.className="btn ghost"; del.type="button"; del.textContent="Eliminar";
+    del.onclick=()=>{
+      openModal({title:"¿Eliminar esta fuente guardada?",body:`Se eliminará "${r.tipo} · Fuente ${r.fuente}" de este navegador.`,
+        actions:[{label:"Cancelar"},{label:"Eliminar",primary:true,warn:true,onClick:()=>{delete records[r.key];persist();renderList();openPanel();}}]});
+    };
+    btns.appendChild(del);
     plist.appendChild(card);
+  });
+  const previous=Object.values(previousRecords).sort((a,b)=>(b.updatedAt||0)-(a.updatedAt||0));
+  if(previous.length){
+    const label=document.createElement("h4");label.textContent="Inspecciones anteriores";label.style.margin="12px 0 2px";plist.append(label);
+    previous.forEach(r=>{const card=document.createElement("div");card.className="pcard";const title=document.createElement("h4");title.textContent=`${r.tipo} · Fuente ${r.fuente}`;const detail=document.createElement("p");detail.className="psub";detail.textContent=`${r.estado==="enviada"?"Enviada":"Borrador"} · ${fmt(r.updatedAt)}`;card.append(title,detail);if(r.estado!=="enviada"){const button=document.createElement("button");button.className="btn ghost";button.textContent="Continuar";button.onclick=()=>{records[r.key]=r;delete previousRecords[r.key];persist();closePanel();$("startView").hidden=true;$("listView").hidden=false;$("finalBar").hidden=false;$("insp").value=r.inspector||"";renderList();openCheck(r.tipo,r.fuente)};card.append(button)}plist.append(card)});
+  }
+  const reports=Object.values(informes).sort((a,b)=>b.createdAt-a.createdAt);
+  if(reports.length){
+    const label=document.createElement("h4");label.textContent="Informes recientes";label.style.margin="12px 0 2px";plist.append(label);
+    reports.forEach(inf=>{const card=document.createElement("div");card.className="pcard";const title=document.createElement("h4");title.textContent=inf.nombre;const detail=document.createElement("p");detail.className="psub";detail.textContent=`${inf.count} fuentes · ${fmt(inf.createdAt)}`;const button=document.createElement("button");button.className="btn ghost";button.type="button";button.textContent="Descargar PDF";button.onclick=()=>downloadPdf(inf.base64,inf.nombre);card.append(title,detail,button);plist.append(card)});
   }
   root.querySelector(".panelOverlay").onclick=closePanel;
   $("closePanel").onclick=closePanel;
   $("clearLocal").onclick=()=>{
-    openModal({title:"¿Borrar la inspección?",body:"Se eliminarán del dispositivo la inspección completa, sus fuentes y su PDF. Esto no elimina lo que ya se envió a Power Automate.",
-      actions:[{label:"Cancelar"},{label:"Borrar inspección",primary:true,warn:true,onClick:()=>{records={};lastPdf=null;persist();persistPdf();renderList();closePanel();showStart();toast("Inspección local borrada");}}]});
+    openModal({title:"¿Borrar datos locales?",body:"Se eliminarán todas las fuentes guardadas y borradores de este navegador. Esto no elimina lo que ya se envió al flujo de Power Automate.",
+      actions:[{label:"Cancelar"},{label:"Borrar todo",primary:true,warn:true,onClick:()=>{records={};previousRecords={};informes={};persist();renderList();closePanel();showStart();toast("Datos locales borrados");}}]});
   };
   root.hidden=false;$("openPanel").setAttribute("aria-expanded","true");
 }
